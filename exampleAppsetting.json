@@ -1,0 +1,38 @@
+{
+  "Logging": {
+    "LogLevel": {
+      "Default": "Information",
+      "Microsoft.AspNetCore": "Warning"
+    }
+  },
+  "AllowedHosts": "*",
+  "ConnectionStrings": {
+    "DefaultConnection": ""
+  },
+  "JwtSettings": {
+    "SecretKey": "",
+    "Issuer": "yourapp",
+    "Audience": "yourapp_users",
+    "ExpireMinutes": 60
+  },
+  "FileStorageSettings": {
+    "FileSignatures": {
+      ".png": [ "89", "50", "4E", "47" ],
+      ".jpg": [ "FF", "D8", "FF" ],
+      ".jpeg": [ "FF", "D8", "FF" ],
+      ".gif": [ "47", "49", "46", "38" ],
+      ".pdf": [ "25", "50", "44", "46" ],
+      ".zip": [ "50", "4B", "03", "04" ]
+    },
+    "Models": {
+      "Formula": {
+        "RelativePath": "Uploads",
+        "MaxFileSizeMB": 100,
+        "AllowedExtensions": [
+          "*",
+          ".xlsx"
+        ]
+      }
+    }
+  }
+}
