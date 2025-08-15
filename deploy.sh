@@ -5,13 +5,7 @@
 set -e  # Dừng nếu có lỗi
 
 echo "🛠️ Building project..."
-rm -rf ./publish
-dotnet publish ./MyApp.csproj -c Release -o publish #|| { echo "❌ Build failed"; exit 1; }
-
-echo "📦 Zipping..."
-cd publish
-zip -r ../app.zip . > /dev/null
-cd ..
+rm -rf ./publish && dotnet publish ./MyApp.csproj -c Release -o publish && cd publish && zip -r ../app.zip . > /dev/null && cd ..
 
 # Đảm bảo file app.zip tồn tại và không bị ghi nữa
 # echo "⏳ Waiting for zip to finish..."

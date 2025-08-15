@@ -5,10 +5,15 @@ using Microsoft.EntityFrameworkCore;
 using System.Linq.Expressions;
 using System.Reflection;
 using System.Text.Json;
+using System.Collections;
+using System.Text;
+using System.Globalization;
+using System.Text.RegularExpressions;
+using Microsoft.EntityFrameworkCore.Query;
 public class PagedResult<T>
 {
     public IEnumerable<T> Items { get; set; } = new List<T>();
-    public int TotalCount { get; set; } // Sau khi filter
+    public int TotalCount { get; set; }
     public int Page { get; set; }
     public int PageSize { get; set; }
 }
@@ -16,46 +21,60 @@ public class PagedResult<T>
 
 public static class QueryableExtensions
 {
-    public static async Task<PagedResult<T>> ToPagedResultAsync<T>(this IQueryable<T> query, int page, int pageSize)
+    public static async Task<PagedResult<T>> ToPagedResultAsync<T>(
+        this IQueryable<T> query, int page, int pageSize)
     {
-        var totalCount = await query.CountAsync();
-        var items = await query.Skip((page - 1) * pageSize).Take(pageSize).ToListAsync();
-        return new PagedResult<T> { Items = items, TotalCount = totalCount, Page = page, PageSize = pageSize };
+        if (query.Provider is IAsyncQueryProvider)
+        {
+            var totalCount = await query.CountAsync();
+            var items = await query.Skip((page - 1) * pageSize)
+                                   .Take(pageSize)
+                                   .ToListAsync();
+            return new PagedResult<T>
+            {
+                Items = items,
+                TotalCount = totalCount,
+                Page = page,
+                PageSize = pageSize
+            };
+        }
+        else
+        {
+            var list = query.ToList();
+            var totalCount = list.Count;
+            var items = list.Skip((page - 1) * pageSize)
+                            .Take(pageSize)
+                            .ToList();
+            return new PagedResult<T>
+            {
+                Items = items,
+                TotalCount = totalCount,
+                Page = page,
+                PageSize = pageSize
+            };
+        }
     }
-    
-    public static IQueryable<T> ApplyDynamicFilter<T>(this IQueryable<T> query, Dictionary<string, object> filters)
+
+
+    public static async Task<IQueryable<T>> ApplyDynamicFilter<T>(
+    this IQueryable<T> query,
+    Dictionary<string, object> filters)
     {
         if (filters == null || filters.Count == 0)
             return query;
 
-        int page = 1;
-        int pageSize = 10;
+        // Helper local để ghép AndAlso khi combined có thể null
+        Expression AndAlso(Expression? left, Expression right) => left == null ? right : Expression.AndAlso(left, right);
 
-        if (filters.TryGetValue("Page", out var pg) && pg is JsonElement pageElement)
-        {
-            if (pageElement.ValueKind == JsonValueKind.Number)
-                page = pageElement.GetInt32();
-            else if (pageElement.ValueKind == JsonValueKind.String && int.TryParse(pageElement.GetString(), out var parsedPage))
-                page = parsedPage;
-        }
-
-        if (filters.TryGetValue("PageSize", out var ps) && ps is JsonElement sizeElement)
-        {
-            if (sizeElement.ValueKind == JsonValueKind.Number)
-                pageSize = sizeElement.GetInt32();
-            else if (sizeElement.ValueKind == JsonValueKind.String && int.TryParse(sizeElement.GetString(), out var parsedSize))
-                pageSize = parsedSize;
-        }
-
-        // Xử lý các điều kiện đặc biệt: StartTime / EndTime
+        // Lấy StartTime / EndTime chung (global)
         filters.TryGetValue("StartTime", out var startTimeRaw);
         filters.TryGetValue("EndTime", out var endTimeRaw);
-
         DateTime? startTime = TryParseDate(startTimeRaw);
         DateTime? endTime = TryParseDate(endTimeRaw);
 
         var actualFilters = filters
-            .Where(kvp => !string.Equals(kvp.Key, "Page", StringComparison.OrdinalIgnoreCase) &&
+            .Where(kvp => !kvp.Key.EndsWith("_Mode", StringComparison.OrdinalIgnoreCase) &&
+                          !string.Equals(kvp.Key, "Page", StringComparison.OrdinalIgnoreCase) &&
                           !string.Equals(kvp.Key, "PageSize", StringComparison.OrdinalIgnoreCase) &&
                           !string.Equals(kvp.Key, "StartTime", StringComparison.OrdinalIgnoreCase) &&
                           !string.Equals(kvp.Key, "EndTime", StringComparison.OrdinalIgnoreCase))
@@ -63,81 +82,315 @@ public static class QueryableExtensions
 
         var param = Expression.Parameter(typeof(T), "x");
         Expression? combined = null;
+
+        bool hasFuzzy = false;
+        List<Func<T, bool>> fuzzyFilters = new();
+
         foreach (var kvp in actualFilters)
         {
+            var key = kvp.Key;
+
+            // --- Xử lý postfix _startDate / _endDate cho từng field ---
+            if (key.EndsWith("_startDate", StringComparison.OrdinalIgnoreCase) ||
+                key.EndsWith("_endDate", StringComparison.OrdinalIgnoreCase))
+            {
+                bool isStart = key.EndsWith("_startDate", StringComparison.OrdinalIgnoreCase);
+                var fieldName = key.Substring(0, key.Length - (isStart ? "_startDate".Length : "_endDate".Length));
+
+                if (string.IsNullOrWhiteSpace(fieldName))
+                    continue;
+
+                var dateProp = typeof(T).GetProperty(fieldName, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase);
+                if (dateProp == null || !dateProp.CanRead)
+                    continue;
+
+                // Only support DateTime / DateTime? here
+                var underlying = Nullable.GetUnderlyingType(dateProp.PropertyType);
+                bool isNullableDate = underlying == typeof(DateTime);
+                bool isPlainDate = dateProp.PropertyType == typeof(DateTime);
+
+                if (!isPlainDate && !isNullableDate)
+                    continue;
+
+                var dt = TryParseDate(kvp.Value);
+                if (dt == null)
+                    continue;
+
+                var dateMember = Expression.Property(param, dateProp.Name);
+
+                Expression dateCondition;
+                if (isNullableDate)
+                {
+                    // member.HasValue && member.Value >=/<= constant
+                    var hasValue = Expression.Property(dateMember, "HasValue");
+                    var valueProp = Expression.Property(dateMember, "Value");
+                    var constExpr = Expression.Constant(dt.Value, typeof(DateTime));
+                    var cmp = isStart
+                        ? Expression.GreaterThanOrEqual(valueProp, constExpr)
+                        : Expression.LessThanOrEqual(valueProp, constExpr);
+                    dateCondition = Expression.AndAlso(hasValue, cmp);
+                }
+                else // DateTime
+                {
+                    var constExpr = Expression.Constant(dt.Value, typeof(DateTime));
+                    dateCondition = isStart
+                        ? (Expression)Expression.GreaterThanOrEqual(dateMember, constExpr)
+                        : (Expression)Expression.LessThanOrEqual(dateMember, constExpr);
+                }
+
+                combined = combined == null ? dateCondition : Expression.AndAlso(combined, dateCondition);
+                continue; // đã xử lý key này, chuyển key khác
+            }
+
+            // --- Các filter bình thường ---
             var prop = typeof(T).GetProperty(kvp.Key, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase);
             if (prop == null || !prop.CanRead) continue;
 
-            if (!TryConvertValue(kvp.Value, prop.PropertyType, out var convertedValue))
-                continue;
-
             var member = Expression.Property(param, prop.Name);
-            Expression constant = Expression.Constant(convertedValue, prop.PropertyType);
-            Expression body;
 
             if (prop.PropertyType == typeof(string))
             {
-                var method = typeof(string).GetMethod("Contains", new[] { typeof(string) })!;
-                body = Expression.Call(member, method, constant);
-            }
-            else if (Nullable.GetUnderlyingType(prop.PropertyType) != null)
-            {
-                var hasValue = Expression.Property(member, "HasValue");
-                var value = Expression.Property(member, "Value");
+                string modeKey = kvp.Key + "_Mode";
+                string mode = filters.TryGetValue(modeKey, out var modeVal) ? modeVal?.ToString() ?? "" : "Normal";
 
-                // Ép kiểu constant nếu chưa khớp với value
-                if (value.Type != constant.Type)
+                if (!TryConvertValue(kvp.Value, typeof(string), out var convertedValue))
+                    continue;
+
+                string searchValue = convertedValue?.ToString() ?? "";
+
+                if (mode.Equals("Fuzzy", StringComparison.OrdinalIgnoreCase))
                 {
-                    constant = Expression.Convert(constant, value.Type);
+                    hasFuzzy = true;
+                    var normSearch = TextUtils.NormalizeFuzzy(searchValue);
+                    int searchLen = normSearch.Length;
+                    const int c = 2;
+                    int tolerance = searchLen  / 2 + c;
+
+                    fuzzyFilters.Add(item =>
+                    {
+                        var propValue = prop.GetValue(item)?.ToString() ?? "";
+                        var normValue = TextUtils.NormalizeFuzzy(propValue);
+                        int valueLen = normValue.Length;
+                        if (searchLen == 0 || valueLen == 0) return false;
+
+                        int winLen = Math.Min(valueLen, searchLen + c);
+
+                        // Trường hợp ngắn hơn hoặc bằng window size → so trực tiếp
+                        if (valueLen <= winLen)
+                            return TextUtils.LevenshteinDistance(normValue, normSearch) <= tolerance;
+
+                        // Trượt cửa sổ, dừng ngay khi tìm được match
+                        ReadOnlySpan<char> span = normValue.AsSpan();
+                        for (int start = 0; start <= valueLen - winLen; start++)
+                        {
+                            if (TextUtils.LevenshteinDistance(span.Slice(start, winLen).ToString(), normSearch) <= tolerance)
+                                return true;
+                        }
+                        return false;
+                    });
+
+                    continue; // đã xử lý fuzzy, không cần thêm vào combined
                 }
 
-                var equal = Expression.Equal(value, constant);
-                body = Expression.AndAlso(hasValue, equal);
+                else
+                {
+                    // Normal search
+                    var toLowerMethod = typeof(string).GetMethod(nameof(string.ToLower), System.Type.EmptyTypes)!;
+                    var trimMethod = typeof(string).GetMethod(nameof(string.Trim), System.Type.EmptyTypes)!;
+
+                    var lowered = Expression.Call(SafeStringMember(member), toLowerMethod);
+                    var trimmed = Expression.Call(lowered, trimMethod);
+
+                    var constNorm = Expression.Constant(searchValue.Trim().ToLowerInvariant());
+                    var containsMethod = typeof(string).GetMethod("Contains", new[] { typeof(string) })!;
+
+                    combined = AndAlso(combined, Expression.Call(trimmed, containsMethod, constNorm));
+                }
             }
             else
             {
-                // Ép kiểu nếu member.Type và constant.Type không khớp
-                if (member.Type != constant.Type)
-                {
-                    constant = Expression.Convert(constant, member.Type);
-                }
+                if (!TryConvertValue(kvp.Value, prop.PropertyType, out var convertedValue))
+                    continue;
 
-                body = Expression.Equal(member, constant);
+                var constant = Expression.Constant(convertedValue, prop.PropertyType);
+                combined = combined == null ? Expression.Equal(member, constant) : Expression.AndAlso(combined, Expression.Equal(member, constant));
             }
-
-            combined = combined == null ? body : Expression.AndAlso(combined, body);
         }
 
-
-        // Áp dụng StartTime và EndTime (nếu có)
-        var dateProp = typeof(T).GetProperty("CreatedAt") ?? typeof(T).GetProperty("TimeCreated");
-        if (dateProp != null && dateProp.PropertyType == typeof(DateTime))
+        // --- Global CreatedAt / TimeCreated filtering (unchanged) ---
+        var datePropGlobal = typeof(T).GetProperty("CreatedAt") ?? typeof(T).GetProperty("TimeCreated");
+        if (datePropGlobal != null && datePropGlobal.PropertyType == typeof(DateTime))
         {
-            var dateMember = Expression.Property(param, dateProp.Name);
+            var dateMember = Expression.Property(param, datePropGlobal.Name);
 
             if (startTime != null)
             {
-                var startConst = Expression.Constant(startTime.Value);
+                var startConst = Expression.Constant(startTime.Value, typeof(DateTime));
                 var startCond = Expression.GreaterThanOrEqual(dateMember, startConst);
                 combined = combined == null ? startCond : Expression.AndAlso(combined, startCond);
             }
 
             if (endTime != null)
             {
-                var endConst = Expression.Constant(endTime.Value);
+                var endConst = Expression.Constant(endTime.Value, typeof(DateTime));
                 var endCond = Expression.LessThanOrEqual(dateMember, endConst);
                 combined = combined == null ? endCond : Expression.AndAlso(combined, endCond);
             }
         }
 
+        // Apply normal filters in EF
         if (combined != null)
         {
             var predicate = Expression.Lambda<Func<T, bool>>(combined, param);
             query = query.Where(predicate);
         }
 
-        return query;
+        // Only load from DB if fuzzy filter exists
+        if (hasFuzzy)
+        {
+            var list = await query.ToListAsync();
+            foreach (var fuzzy in fuzzyFilters)
+                list = list.Where(fuzzy).ToList();
+
+            return list.AsQueryable(); // in-memory IQueryable
+        }
+
+        return query; // still EF IQueryable
     }
+
+
+
+
+    private static Expression SafeStringMember(Expression member)
+    {
+        var nullConst = Expression.Constant(string.Empty, typeof(string));
+        return Expression.Condition(
+            Expression.Equal(member, Expression.Constant(null, typeof(string))),
+            nullConst,
+            member
+        );
+    }
+
+    private static Expression AndAlso(Expression? left, Expression right)
+    {
+        return left == null ? right : Expression.AndAlso(left, right);
+    }
+
+    public static class TextUtils
+    {
+        public static int LevenshteinDistance(string s, string t)
+        {
+            if (string.IsNullOrEmpty(s)) return t.Length;
+            if (string.IsNullOrEmpty(t)) return s.Length;
+
+            var dp = new int[s.Length + 1, t.Length + 1];
+            for (int i = 0; i <= s.Length; i++) dp[i, 0] = i;
+            for (int j = 0; j <= t.Length; j++) dp[0, j] = j;
+
+            for (int i = 1; i <= s.Length; i++)
+            {
+                for (int j = 1; j <= t.Length; j++)
+                {
+                    int cost = (s[i - 1] == t[j - 1]) ? 0 : 1;
+                    dp[i, j] = Math.Min(
+                        Math.Min(dp[i - 1, j] + 1, dp[i, j - 1] + 1),
+                        dp[i - 1, j - 1] + cost
+                    );
+                }
+            }
+            return dp[s.Length, t.Length];
+        }
+
+
+        public static string NormalizeQuick(string? input)
+        {
+            return (input ?? "").Trim().ToLowerInvariant();
+        }
+
+        public static string NormalizeFuzzy(string? input)
+        {
+            if (string.IsNullOrWhiteSpace(input))
+                return string.Empty;
+
+            var lower = input.Trim().ToLowerInvariant();
+            var normalized = lower.Normalize(NormalizationForm.FormD);
+            var sb = new StringBuilder();
+            foreach (var ch in normalized)
+            {
+                var uc = CharUnicodeInfo.GetUnicodeCategory(ch);
+                if (uc != UnicodeCategory.NonSpacingMark)
+                    sb.Append(ch);
+            }
+            return Regex.Replace(sb.ToString(), @"\s+", "");
+
+        }
+        public static int LevenshteinDistance(ReadOnlySpan<char> source, ReadOnlySpan<char> target, int tolerance)
+        {
+            int n = source.Length;
+            int m = target.Length;
+
+            // Nếu chênh lệch độ dài lớn hơn tolerance thì bỏ luôn
+            if (Math.Abs(n - m) > tolerance)
+                return tolerance + 1;
+
+            // Luôn để n >= m để giảm kích thước mảng
+            if (n < m)
+            {
+                var tempSpan = source;
+                source = target;
+                target = tempSpan;
+                n = source.Length;
+                m = target.Length;
+            }
+
+            var prevRow = new int[m + 1];
+            var currRow = new int[m + 1];
+
+            for (int j = 0; j <= m; j++)
+                prevRow[j] = j;
+
+            for (int i = 1; i <= n; i++)
+            {
+                currRow[0] = i;
+
+                // Giới hạn window theo tolerance
+                int start = Math.Max(1, i - tolerance);
+                int end = Math.Min(m, i + tolerance);
+
+                // Nếu start > 1, set giá trị trước đó = tolerance+1 (ngoài phạm vi)
+                if (start > 1)
+                    currRow[start - 1] = tolerance + 1;
+
+                int minInRow = tolerance + 1;
+
+                for (int j = start; j <= end; j++)
+                {
+                    int cost = source[i - 1] == target[j - 1] ? 0 : 1;
+                    currRow[j] = Math.Min(
+                        Math.Min(prevRow[j] + 1,     // delete
+                                 currRow[j - 1] + 1), // insert
+                        prevRow[j - 1] + cost         // replace
+                    );
+
+                    if (currRow[j] < minInRow)
+                        minInRow = currRow[j];
+                }
+
+                // Nếu hàng này toàn giá trị > tolerance thì bỏ luôn
+                if (minInRow > tolerance)
+                    return tolerance + 1;
+
+                // Hoán đổi mảng
+                var tmp = prevRow;
+                prevRow = currRow;
+                currRow = tmp;
+            }
+
+            return prevRow[m];
+        }
+    }
+
+
     private static DateTime? TryParseDate(object? value)
     {
         try
@@ -169,7 +422,6 @@ public static class QueryableExtensions
             if (value is JsonElement jsonElement)
             {
                 var extracted = ExtractJsonValue(jsonElement);
-                // Nếu extract ra vẫn là JsonElement, cố gắng ép kiểu boolean
                 if (extracted is JsonElement innerJson)
                 {
                     switch (innerJson.ValueKind)
@@ -273,5 +525,7 @@ public static class QueryableExtensions
             _ => element.ToString()
         };
     }
+
+
 
 }

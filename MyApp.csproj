@@ -16,9 +16,15 @@
     </PackageReference>
     <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="9.0.6" />
     <PackageReference Include="Swashbuckle.AspNetCore" Version="6.6.2" />
-     <None Update="app.db">
-    <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory> 
-  </None>
+    <None Update="app.db">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory> 
+    </None>
+  </ItemGroup>
+
+  <!-- Chỉ loại bỏ uploads/** khi publish -->
+  <ItemGroup Condition="'$(Publish)' == 'true'">
+    <None Remove="uploads\**" />
+    <Content Remove="uploads\**" />
   </ItemGroup>
 
 </Project>

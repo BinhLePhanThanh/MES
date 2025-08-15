@@ -17,10 +17,14 @@ public class Product
     public int FormulaApprobationCount { get; set; } = 0;
     public bool IsActive { get; set; } = true;
     public DateTime? UpdatedAt { get; set; }
+    public DateTime? ChangeableDate { get; set; } = null;
     [ForeignKey("UpdatedBy")]
     public int? UpdatedById { get; set; }
     public Employee? UpdatedBy { get; set; } = null!;
     public string? Description { get; set; } = string.Empty;
+    [ForeignKey("Unit")]
+    public int? UnitId { get; set; }
+    public Unit? Unit { get; set; } = null!;
     
     [ForeignKey("Type")]
     public int? TypeId { get; set; }

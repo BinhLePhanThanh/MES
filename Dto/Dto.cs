@@ -7,6 +7,8 @@ public class ProductDto
     public DateTime CreatedAt { get; set; }
     public int? CreatedById { get; set; }
     public DateTime? UpdatedAt { get; set; }
+    public DateTime? ChangeableDate { get; set; } = null;
+    public int? UnitId { get; set; }
     public int? UpdatedById { get; set; }
     public string? Description { get; set; } = string.Empty;
 }

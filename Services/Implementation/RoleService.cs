@@ -52,7 +52,7 @@ public class RoleService : IRoleService
         int page = filters.TryGetValue("Page", out var pg) && pg is JsonElement pElem && pElem.TryGetInt32(out var pVal) ? pVal : 1;
         int pageSize = filters.TryGetValue("PageSize", out var ps) && ps is JsonElement sElem && sElem.TryGetInt32(out var sVal) ? sVal : 10;
 
-        var query = _context.Roles.AsQueryable().ApplyDynamicFilter(filters);
+        var query = await _context.Roles.AsQueryable().ApplyDynamicFilter(filters);
         return await query.ToPagedResultAsync(page, pageSize);
     }
 
